@@ -1,4 +1,8 @@
 import json
+import os
+import re
+import threading
+import time
 
 from stages.stage1_inventory.classifier import classify, decide_type
 from stages.stage1_inventory.inventory import build_inventory, write_inventory
@@ -288,3 +292,93 @@ def test_build_and_write_inventory(tmp_path):
 
     assert len(saved_inventory["files"]) == 2
     assert saved_inventory["summary"]["total_files"] == 2
+    assert os.path.basename(os.path.dirname(output_path)) == "stage1_outputs"
+    assert re.fullmatch(
+        r"source_inventory_\d{8}_\d{6}\.json",
+        os.path.basename(output_path),
+    )
+
+
+def test_stopped_inventory_saves_completed_files(tmp_path):
+    """Save a timestamped partial inventory after a stop request."""
+    source_folder = tmp_path / "tdc_all_files"
+    source_folder.mkdir()
+    (source_folder / "first.txt").write_text("first prose line", encoding="utf-8")
+    (source_folder / "second.txt").write_text("second prose line", encoding="utf-8")
+    stop_event = threading.Event()
+
+    def report_progress(processed, total, relative_path):
+        """Request cancellation after the first classified file."""
+        if processed == 1:
+            stop_event.set()
+
+    inventory = build_inventory(
+        str(source_folder),
+        should_stop=stop_event.is_set,
+        on_progress=report_progress,
+    )
+    output_path = write_inventory(inventory, str(tmp_path / "workspace"))
+
+    assert inventory["summary"]["total_files"] == 1
+    assert inventory["files"][0]["path"] == "first.txt"
+    assert re.fullmatch(
+        r"tdc_all_files_inventory_\d{8}_\d{6}\.json",
+        os.path.basename(output_path),
+    )
+
+
+def test_app_copies_files_by_type_as_they_are_classified(tmp_path, monkeypatch):
+    """Copy classified source files into per-type folders."""
+    import app as flask_app
+
+    source_folder = tmp_path / "tdc_all_files"
+    source_folder.mkdir()
+    (source_folder / "program.txt").write_text(
+        "\n".join(
+            [
+                "       IDENTIFICATION DIVISION.",
+                "       PROGRAM-ID. TESTPGM.",
+                "       ENVIRONMENT DIVISION.",
+                "       DATA DIVISION.",
+                "       WORKING-STORAGE SECTION.",
+                "       01  WS-A  PIC 9(3).",
+                "       PROCEDURE DIVISION.",
+                "           MOVE 1 TO WS-A.",
+                "           STOP RUN.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        flask_app,
+        "WORKSPACE_DIR",
+        str(tmp_path / "workspace"),
+    )
+    flask_app.app.config.update(TESTING=True)
+
+    with flask_app.app.test_client() as client:
+        response = client.post(
+            "/",
+            data={"folder_path": str(source_folder)},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        assert response.is_json
+        job_id = response.get_json()["job_id"]
+
+        for _ in range(500):
+            status = client.get(f"/status/{job_id}").get_json()
+            if status["status"] != "running":
+                break
+            time.sleep(0.01)
+
+        copied_file = (
+            tmp_path
+            / "workspace"
+            / "sorted_tdc_all_files"
+            / "cobol_program"
+            / "program.txt"
+        )
+        assert status["status"] == "complete"
+        assert copied_file.read_text(encoding="utf-8") == (
+            source_folder / "program.txt"
+        ).read_text(encoding="utf-8")
