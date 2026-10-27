@@ -292,6 +292,11 @@ def test_build_and_write_inventory(tmp_path):
 
     assert len(saved_inventory["files"]) == 2
     assert saved_inventory["summary"]["total_files"] == 2
+    assert saved_inventory["complete"] is True
+    assert saved_inventory["summary"]["gap_count"] >= 1
+    assert all("sha256" in entry for entry in saved_inventory["files"])
+    assert all("declared_names" in entry for entry in saved_inventory["files"])
+    assert all("references" in entry for entry in saved_inventory["files"])
     assert os.path.basename(os.path.dirname(output_path)) == "stage1_outputs"
     assert re.fullmatch(
         r"source_inventory_\d{8}_\d{6}\.json",
@@ -321,6 +326,10 @@ def test_stopped_inventory_saves_completed_files(tmp_path):
 
     assert inventory["summary"]["total_files"] == 1
     assert inventory["files"][0]["path"] == "first.txt"
+    assert inventory["complete"] is False
+    assert inventory["gaps"] == []
+    assert inventory["entry_points"] == []
+    assert inventory["duplicates"] == {"names": [], "identical_files": []}
     assert re.fullmatch(
         r"tdc_all_files_inventory_\d{8}_\d{6}\.json",
         os.path.basename(output_path),

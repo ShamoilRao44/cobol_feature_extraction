@@ -57,6 +57,7 @@
                 <th>Type</th>
                 <th>Confidence</th>
                 <th>Runner-up</th>
+                <th>Declared</th>
                 <th>Evidence</th>
                 <th>Encoding</th>
                 <th>Format</th>
@@ -70,6 +71,7 @@
                 <td>{{ file.type }}</td>
                 <td>{{ file.confidence }}</td>
                 <td>{{ file.runner_up if file.runner_up is not none else "-" }}</td>
+                <td>{{ file.declared_names|join(", ") if file.declared_names else "-" }}</td>
                 <td><small>{% for item in file.evidence %}{% if not loop.first %}<br>{% endif %}{{ item }}{% else %}-{% endfor %}</small></td>
                 <td>{{ file.encoding if file.encoding is not none else "-" }}</td>
                 <td>{{ file.source_format if file.source_format is not none else "-" }}</td>
@@ -78,6 +80,40 @@
             {% endfor %}
         </tbody>
     </table>
+    {% if inventory.complete %}
+    <h2>Gaps ({{ inventory.summary.gap_count }})</h2>
+    <table>
+        <thead>
+            <tr><th>Name</th><th>Kind</th><th>Referenced by</th></tr>
+        </thead>
+        <tbody>
+            {% for gap in inventory.gaps %}
+            <tr>
+                <td>{{ gap.name }}</td>
+                <td>{{ gap.kinds|join(", ") }}</td>
+                <td><small>{% for reference in gap.referenced_by %}{% if not loop.first %}<br>{% endif %}{{ reference.file }}:{{ reference.line }}{% endfor %}</small></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Entry points ({{ inventory.summary.entry_point_count }})</h2>
+    <table>
+        <thead>
+            <tr><th>Name</th><th>File</th><th>Kind</th><th>Inferred</th></tr>
+        </thead>
+        <tbody>
+            {% for entry in inventory.entry_points %}
+            <tr>
+                <td>{{ entry.name }}</td>
+                <td>{{ entry.path }}</td>
+                <td>{{ entry.kind }}</td>
+                <td>{{ "yes" if entry.inferred else "no" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
     {% endif %}
 
     <script>

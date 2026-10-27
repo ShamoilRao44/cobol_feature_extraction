@@ -38,6 +38,8 @@ def run_inventory(job_id, folder_path):
                 job["total"] = total
                 if relative_path is None:
                     job["logs"].append(f"Found {total} files. Classification started.")
+                elif relative_path == "Resolving references":
+                    job["logs"].append("Resolving references")
                 else:
                     job["logs"].append(f"Classified {processed}/{total}: {relative_path}")
 
@@ -57,12 +59,7 @@ def run_inventory(job_id, folder_path):
             job["inventory"] = inventory
             job["inventory_path"] = output_path
             job["display_path"] = relative_output
-            job["status"] = (
-                "stopped"
-                if job["stop_event"].is_set()
-                and job["processed"] < job["total"]
-                else "complete"
-            )
+            job["status"] = "complete" if inventory["complete"] else "stopped"
             if job["status"] == "stopped":
                 job["logs"].append(
                     f"Stopped after {job['processed']} of {job['total']} files."

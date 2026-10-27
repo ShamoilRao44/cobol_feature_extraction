@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from stages.stage1_inventory.scanner import list_files
@@ -24,7 +26,10 @@ def test_files_inside_git_directory_are_skipped(tmp_path):
 def test_missing_folder_raises_value_error(tmp_path):
     missing_folder = tmp_path / "missing"
 
-    with pytest.raises(ValueError, match=f"Folder not found: {missing_folder}"):
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"Folder not found: {missing_folder}"),
+    ):
         list_files(str(missing_folder))
 
 
