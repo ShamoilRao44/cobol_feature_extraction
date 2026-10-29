@@ -22,7 +22,7 @@
     <section id="job-controls" {% if not job %}hidden{% endif %}>
         <button type="button" id="stop-button" {% if job and job.status != "running" %}hidden{% endif %}>Stop</button>
         <details id="progress-log" {% if job and job.status == "running" %}open{% endif %}>
-            <summary>Inventory progress</summary>
+            <summary>Progress</summary>
             <ol id="progress-messages">
                 {% if job %}
                 {% for message in job.logs %}
@@ -114,6 +114,44 @@
         </tbody>
     </table>
     {% endif %}
+
+    <section>
+        <h2>Per-file IR</h2>
+        <button type="button" id="build-ir-button" {% if not inventory_ready %}disabled{% endif %}>Build IR</button>
+        <p id="ir-error" style="color: red;"></p>
+        {% if ir_result %}
+        <p>IR output folder: {{ ir_output_path }}</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>File</th>
+                    <th>Type</th>
+                    <th>Parse status</th>
+                    <th>Counts</th>
+                    <th>IR file</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for file in ir_result.files %}
+                <tr{% if file.parse_status == "partial" %} style="background:#fff3cd"{% endif %}>
+                    <td>{{ file.path }}</td>
+                    <td>{{ file.type }}</td>
+                    <td>{{ file.parse_status }}</td>
+                    <td>{% for key, value in file.counts.items() %}{{ key }}: {{ value }}{% if not loop.last %}, {% endif %}{% else %}-{% endfor %}</td>
+                    <td>{{ file.ir_file }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+    {% endif %}
+    {% if inventory is none %}
+    <section>
+        <h2>Per-file IR</h2>
+        <button type="button" id="build-ir-button" disabled>Build IR</button>
+        <p id="ir-error" style="color: red;"></p>
+    </section>
     {% endif %}
 
     <script>
@@ -199,6 +237,37 @@
         });
 
         document.addEventListener("click", async (event) => {
+            if (event.target.id === "build-ir-button") {
+                event.preventDefault();
+                if (activeJobId || event.target.disabled) {
+                    return;
+                }
+                const button = event.target;
+                const irError = document.getElementById("ir-error");
+                const controls = document.getElementById("job-controls");
+                const messages = document.getElementById("progress-messages");
+                irError.textContent = "";
+                button.disabled = true;
+                controls.hidden = false;
+                messages.replaceChildren();
+                document.getElementById("progress-log").open = true;
+                addMessage("Starting IR build...");
+                try {
+                    const response = await fetch("/build-ir", { method: "POST" });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result.error || "Could not start IR build.");
+                    }
+                    activeJobId = result.job_id;
+                    nextLog = 0;
+                    updateProgress(activeJobId);
+                } catch (error) {
+                    controls.hidden = true;
+                    irError.textContent = error.message;
+                    button.disabled = false;
+                }
+                return;
+            }
             if (event.target.id !== "stop-button") {
                 return;
             }
