@@ -16,7 +16,7 @@ def build_file_ir(
 ) -> dict:
     """Build the header and supported body for one file."""
     header = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "path": rel_path,
         "type": file_type,
         "sha256": sha256,

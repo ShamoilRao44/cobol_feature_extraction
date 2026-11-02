@@ -2,6 +2,7 @@ import re
 
 from stages.stage1_inventory.models import FileContent
 from stages.stage2_ir.common import (
+    find_candidates,
     find_exec_blocks,
     normalize,
     paragraph_of,
@@ -51,7 +52,7 @@ ACCESS_MODE = re.compile(
 FILE_STATUS = re.compile(r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9-]+)", re.IGNORECASE)
 FD = re.compile(r"^\s*(FD|SD)\s+([A-Z0-9-]+)", re.IGNORECASE)
 LEVEL_01 = re.compile(r"^\s*01\s+([A-Z0-9-]+)\b", re.IGNORECASE)
-SECTION = re.compile(r"^\s*(?:WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SECTION\b", re.IGNORECASE)
+SECTION = re.compile(r"^\s*(?:FILE|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\s+SECTION\b", re.IGNORECASE)
 COPY = re.compile(r"^\s*COPY\s+[\"']?([A-Z0-9][A-Z0-9_-]*)", re.IGNORECASE)
 COPY_REPLACING = re.compile(r"\bREPLACING\b", re.IGNORECASE)
 PARAGRAPH = re.compile(r"^[A-Z0-9][A-Z0-9-]*\.$", re.IGNORECASE)
@@ -105,12 +106,19 @@ CURSOR_FETCH = re.compile(
 HOST_VAR = re.compile(r":([A-Z][A-Z0-9-]*)", re.IGNORECASE)
 INCLUDE_NAME = re.compile(r"\bINCLUDE\s+([A-Z0-9_-]+)", re.IGNORECASE)
 CICS_OPTION = {
-    "map": re.compile(r"(?<![A-Z-])MAP\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
-    "mapset": re.compile(r"(?<![A-Z-])MAPSET\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
-    "program": re.compile(r"(?<![A-Z-])PROGRAM\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
-    "transid": re.compile(r"(?<![A-Z-])TRANSID\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
-    "file": re.compile(r"(?<![A-Z-])(?:FILE|DATASET)\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
-    "queue": re.compile(r"(?<![A-Z-])(?:QUEUE|QNAME)\(\s*(['\"])?([A-Z0-9#@$_-]+)\1?\s*\)", re.IGNORECASE),
+    key: re.compile(
+        rf"""(?<![A-Z0-9-])(?:{names})\s*\(\s*(['"]?)([^'")\s]+)\1\s*\)""",
+        re.IGNORECASE,
+    )
+    for key, names in {
+        "map": "MAP",
+        "mapset": "MAPSET",
+        "program": "PROGRAM",
+        "transid": "TRANSID",
+        "file": "FILE|DATASET",
+        "queue": "QUEUE|QNAME",
+        "commarea": "COMMAREA",
+    }.items()
 }
 CICS_TWO_WORD_COMMAND = re.compile(
     r"^(SEND\s+(MAP|TEXT|CONTROL)|RECEIVE\s+MAP|"
@@ -226,6 +234,9 @@ def build_program_ir(
     )
     files = _find_files(lines, divisions["environment"], divisions["data"])
     record_files = _find_record_files(lines, divisions["data"])
+    file_records = _find_file_records(lines, divisions["data"])
+    for file_info in files:
+        file_info["record"] = file_records.get(file_info["logical_name"])
     copybooks = _find_copybooks(lines)
     data_items = []
     if divisions["data"] is not None:
@@ -233,8 +244,31 @@ def build_program_ir(
         data_lines = lines[divisions["data"]:data_end]
         data_items = parse_data_items(data_lines)
     linkage = _find_linkage(lines, divisions["procedure"])
-    sql_items, cics_items = _build_exec_items(exec_blocks, name, paragraphs)
-    calls = _find_calls(lines, exec_blocks, name, paragraphs)
+    sql_items, cics_items = _build_exec_items(
+        exec_blocks, name, paragraphs, lines, data_items
+    )
+    calls = _find_calls(lines, exec_blocks, name, paragraphs, data_items)
+    for paragraph in paragraphs:
+        paragraph["comment"] = _paragraph_comment(
+            content.raw_lines, paragraph["line_start"], content.source_format
+        )
+    header_comment = _header_comment(
+        content.raw_lines,
+        lines[program_match[0]][0] if program_match else None,
+        lines[divisions["procedure"]][0] if divisions["procedure"] is not None else None,
+        content.source_format,
+    )
+    issues = [
+        {
+            "kind": "cics_target_missing",
+            "line": item["line"],
+            "detail": item["_block_text"][:80],
+        }
+        for item in cics_items
+        if item["command"] in {"LINK", "XCTL", "LOAD"} and item["program"] is None
+    ]
+    for item in cics_items:
+        item.pop("_block_text", None)
     conditions, events = _build_paragraph_events(
         lines,
         paragraphs,
@@ -262,6 +296,7 @@ def build_program_ir(
     program = {
         "id": f"pgm:{name}",
         "name": name,
+        "header_comment": header_comment,
         "line_span": [first_line, last_line],
         "dialect": dialect,
         "files": files,
@@ -272,6 +307,7 @@ def build_program_ir(
         "cics": cics_items,
         "calls": calls,
         "conditions": conditions,
+        "issues": issues,
         "paragraphs": paragraphs,
         "metrics": metrics,
     }
@@ -306,6 +342,7 @@ def _find_files(
         files.append(
             {
                 "logical_name": logical_name,
+                "record": None,
                 "ddname": ddname,
                 "organization": (
                     normalize(organization_match.group(1)).upper()
@@ -354,10 +391,54 @@ def _find_record_files(
     return record_files
 
 
+def _find_file_records(
+    lines: list[tuple[int, str]],
+    data_index: int | None,
+) -> dict[str, str]:
+    """Map each FD name to its first 01-level record."""
+    if data_index is None:
+        return {}
+    in_file_section = False
+    current_file = None
+    records = {}
+    for _, text in lines[data_index:]:
+        if re.search(r"\bFILE\s+SECTION\b", text, re.IGNORECASE):
+            in_file_section = True
+            continue
+        if in_file_section and SECTION.search(text):
+            break
+        if not in_file_section:
+            continue
+        fd_match = FD.match(text)
+        if fd_match:
+            current_file = fd_match.group(2).upper()
+            continue
+        record_match = LEVEL_01.match(text)
+        if record_match and current_file:
+            records.setdefault(current_file, record_match.group(1).upper())
+            current_file = None
+    return records
+
+
 def _find_copybooks(lines: list[tuple[int, str]]) -> list[dict]:
     """Extract COPY statements and REPLACING indicators."""
     copybooks = []
+    section = None
     for index, (line_number, text) in enumerate(lines):
+        if re.search(r"^\s*ENVIRONMENT\s+DIVISION\b", text, re.IGNORECASE):
+            section = "ENVIRONMENT"
+        elif re.search(r"^\s*DATA\s+DIVISION\b", text, re.IGNORECASE):
+            section = None
+        elif re.search(r"^\s*FILE\s+SECTION\b", text, re.IGNORECASE):
+            section = "FILE"
+        elif re.search(r"^\s*WORKING-STORAGE\s+SECTION\b", text, re.IGNORECASE):
+            section = "WORKING-STORAGE"
+        elif re.search(r"^\s*LOCAL-STORAGE\s+SECTION\b", text, re.IGNORECASE):
+            section = "LOCAL-STORAGE"
+        elif re.search(r"^\s*LINKAGE\s+SECTION\b", text, re.IGNORECASE):
+            section = "LINKAGE"
+        elif re.search(r"^\s*PROCEDURE\s+DIVISION\b", text, re.IGNORECASE):
+            section = "PROCEDURE"
         match = COPY.match(text)
         if not match:
             continue
@@ -367,6 +448,7 @@ def _find_copybooks(lines: list[tuple[int, str]]) -> list[dict]:
                 "name": match.group(1).upper(),
                 "line": line_number,
                 "replacing": bool(COPY_REPLACING.search(statement)),
+                "section": section,
             }
         )
     return copybooks
@@ -421,6 +503,7 @@ def _find_paragraphs(
             {
                 "id": f"para:{program_name}.(START)",
                 "name": "(START)",
+                "comment": None,
                 "line_start": first_code_line,
                 "line_end": last_line,
                 "events": [],
@@ -434,6 +517,7 @@ def _find_paragraphs(
             {
                 "id": f"para:{program_name}.{name}",
                 "name": name,
+                "comment": None,
                 "line_start": line_number,
                 "line_end": end_line,
                 "events": [],
@@ -447,6 +531,8 @@ def _build_exec_items(
     blocks: list[dict],
     program_name: str,
     paragraphs: list[dict],
+    lines: list[tuple[int, str]],
+    data_items: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     """Build normalized SQL and CICS block records."""
     sql_items = []
@@ -465,7 +551,11 @@ def _build_exec_items(
             else:
                 pending.append(item)
         else:
-            cics_items.append(_cics_item(block, program_name, counts[kind], paragraphs))
+            cics_items.append(
+                _cics_item(
+                    block, program_name, counts[kind], paragraphs, lines, data_items
+                )
+            )
     for item in pending:
         if item["kind"] not in {"open", "fetch", "close"} or not item["cursor"]:
             continue
@@ -526,6 +616,7 @@ def _sql_item(
         "id": f"sql:{program_name}.{order}",
         "kind": "other" if dynamic else kind,
         "tables": tables,
+        "columns": _sql_columns(kind, text),
         "access": access,
         "cursor": cursor,
         "host_vars": host_vars,
@@ -565,11 +656,104 @@ def _sql_tables(kind: str, text: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _sql_columns(kind: str, text: str) -> list[str]:
+    """Extract selected or modified SQL column names."""
+    values = []
+    if kind in {"select", "declare_cursor"}:
+        match = re.search(r"\bSELECT\b", text, re.IGNORECASE)
+        if match:
+            start = match.end()
+            modifier = re.match(r"\s*(?:DISTINCT|ALL)\b", text[start:], re.IGNORECASE)
+            if modifier:
+                start += modifier.end()
+            end = _top_level_word(text, start, {"INTO", "FROM"})
+            values = _split_sql_commas(text[start:end])
+        values = [re.split(r"\s+AS\s+", value, maxsplit=1, flags=re.IGNORECASE)[0] for value in values]
+    elif kind == "insert":
+        match = re.search(r"\bINSERT\s+INTO\s+[^\s(]+\s*\((.*?)\)", text, re.IGNORECASE)
+        values = _split_sql_commas(match.group(1)) if match else []
+    elif kind == "update":
+        match = re.search(r"\bSET\b", text, re.IGNORECASE)
+        if match:
+            start = match.end()
+            end = _top_level_word(text, start, {"WHERE"})
+            values = _split_sql_commas(text[start:end])
+        values = [value.split("=", 1)[0] for value in values]
+    columns = []
+    for value in values:
+        value = value.strip()
+        if not value or value.startswith(":"):
+            continue
+        columns.append(value.upper()[:60])
+        if len(columns) == 60:
+            break
+    return columns
+
+
+def _top_level_word(text: str, start: int, words: set[str]) -> int:
+    """Find the first SQL clause word outside strings and parentheses."""
+    depth = 0
+    quote = None
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and (
+            index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")
+        ):
+            match = re.match(r"[A-Z]+", text[index:], re.IGNORECASE)
+            end = index + match.end() if match else index
+            if (
+                match
+                and match.group(0).upper() in words
+                and (end == len(text) or not (text[end].isalnum() or text[end] == "_"))
+            ):
+                return index
+        index += 1
+    return len(text)
+
+
+def _split_sql_commas(text: str) -> list[str]:
+    """Split SQL expressions on commas outside parentheses."""
+    parts = []
+    depth = 0
+    start = 0
+    quote = None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
+
+
 def _cics_item(
     block: dict,
     program_name: str,
     order: int,
     paragraphs: list[dict],
+    lines: list[tuple[int, str]],
+    data_items: list[dict],
 ) -> dict:
     """Parse one CICS block into command and option fields."""
     text = block["text"]
@@ -581,12 +765,68 @@ def _cics_item(
         else words[0].upper() if words else ""
     )
     values = {}
-    dynamic = False
+    dynamic_options = []
     for key, regex in CICS_OPTION.items():
         match = regex.search(text)
         values[key] = match.group(2).upper() if match else None
         if match and not match.group(1):
-            dynamic = True
+            dynamic_options.append((key, match.group(2).upper()))
+    target_option = next(
+        (
+            variable for key in ("program", "map", "mapset", "file", "queue")
+            for option_key, variable in dynamic_options if option_key == key
+        ),
+        None,
+    )
+    candidates = find_candidates(lines, data_items, target_option) if target_option else []
+    dynamic = target_option is not None
+    command_type = command.split()[0] if command else ""
+    queue_scope = None
+    if command_type in {"READQ", "WRITEQ", "DELETEQ"} and values["queue"]:
+        queue_match = CICS_OPTION["queue"].search(text)
+        if queue_match and queue_match.group(1):
+            queue_scope = "shared"
+        else:
+            variable = values["queue"].split()[0].split(".")[0]
+            variable = variable.split("(", 1)[0].split(" OF ", 1)[0]
+            parent_index = next(
+                (index for index, item in enumerate(data_items) if item["name"] == variable),
+                None,
+            )
+            children = set()
+            if parent_index is not None:
+                parent_level = data_items[parent_index]["level"]
+                for item in data_items[parent_index + 1:]:
+                    if item["level"] <= parent_level:
+                        break
+                    children.add(item["name"])
+            transaction_targets = {variable} | children
+            for index, (line_number, line) in enumerate(lines):
+                if not re.match(r"^\s*MOVE\b", line, re.IGNORECASE):
+                    continue
+                statement, _ = statement_text(lines, index)
+                move = re.match(
+                    r"^\s*MOVE\s+(EIBTRNID|EIBTRMID)\s+TO\s+(.+)$",
+                    statement,
+                    re.IGNORECASE,
+                )
+                if move:
+                    targets = set()
+                    skip_next = False
+                    for token in re.findall(
+                        r"[A-Z0-9][A-Z0-9-]*", move.group(2), re.IGNORECASE
+                    ):
+                        if skip_next:
+                            skip_next = False
+                        elif token.upper() == "OF":
+                            skip_next = True
+                        else:
+                            targets.add(token.upper())
+                    if targets & transaction_targets:
+                        queue_scope = "session_private"
+                        break
+            if queue_scope is None:
+                queue_scope = "shared" if candidates else "unknown"
     return {
         "id": f"cics:{program_name}.{order}",
         "command": command,
@@ -596,10 +836,67 @@ def _cics_item(
         "transid": values["transid"],
         "file": values["file"],
         "queue": values["queue"],
+        "commarea": values["commarea"],
         "dynamic": dynamic,
+        "candidates": candidates,
+        "queue_scope": queue_scope,
         "paragraph": paragraph_of(paragraphs, block["start"]),
         "line": block["start"],
+        "_block_text": text,
     }
+
+
+def _comment_text(raw_line: str, source_format: str | None) -> str | None:
+    """Return non-banner text from a source comment line."""
+    if source_format == "fixed":
+        if len(raw_line) < 7 or raw_line[6] not in "*/":
+            return None
+        text = raw_line[7:72].strip()
+    else:
+        stripped = raw_line.lstrip()
+        if not stripped.startswith("*>"):
+            return None
+        text = stripped[2:].strip()
+    return text if text and not all(char in "*-= _#." for char in text) else None
+
+
+def _header_comment(
+    raw_lines: list[str],
+    program_id_line: int | None,
+    procedure_line: int | None,
+    source_format: str | None,
+) -> str | None:
+    """Collect header comments before the procedure division."""
+    if program_id_line is None:
+        return None
+    end_line = program_id_line + 40
+    if procedure_line is not None:
+        end_line = min(end_line, procedure_line)
+    comments = [
+        text
+        for raw_line in raw_lines[:end_line]
+        if (text := _comment_text(raw_line, source_format))
+    ]
+    return " ".join(comments)[:300] or None
+
+
+def _paragraph_comment(
+    raw_lines: list[str],
+    header_line: int,
+    source_format: str | None,
+) -> str | None:
+    """Collect up to eight adjacent comment or blank lines above a paragraph."""
+    comments = []
+    start = max(0, header_line - 2)
+    for index in range(start, max(-1, start - 8), -1):
+        raw_line = raw_lines[index]
+        if not raw_line.strip():
+            continue
+        text = _comment_text(raw_line, source_format)
+        if text is None:
+            break
+        comments.append(text)
+    return " ".join(reversed(comments))[:200] or None
 
 
 def _find_calls(
@@ -607,6 +904,7 @@ def _find_calls(
     blocks: list[dict],
     program_name: str,
     paragraphs: list[dict],
+    data_items: list[dict],
 ) -> list[dict]:
     """Extract CALL statements and their USING arguments."""
     blocked = _blocked_line_numbers(blocks)
@@ -640,6 +938,10 @@ def _find_calls(
                 "id": f"call:{program_name}.{len(calls) + 1}",
                 "target": target,
                 "dynamic": bool(match.group(3)),
+                "candidates": (
+                    find_candidates(lines, data_items, target)
+                    if match.group(3) else []
+                ),
                 "args": args,
                 "paragraph": paragraph_of(paragraphs, line_number),
                 "line": line_number,

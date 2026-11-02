@@ -83,7 +83,12 @@ def test_program_ir_files_data_sql_calls_and_events(tmp_path):
     assert program["files"][1]["operations"] == ["WRITE"]
     assert program["files"][1]["access"] == "write"
     assert program["copybooks"] == [
-        {"name": "ACCTREC", "line": line_of(source, "COPY ACCTREC"), "replacing": False}
+        {
+            "name": "ACCTREC",
+            "line": line_of(source, "COPY ACCTREC"),
+            "replacing": False,
+            "section": "WORKING-STORAGE",
+        }
     ]
     assert program["data_items"]
     balance = next(item for item in program["data_items"] if item["name"] == "WS-BALANCE")

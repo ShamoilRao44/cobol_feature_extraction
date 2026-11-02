@@ -1,0 +1,1 @@
+"""Consolidated project IR stage."""

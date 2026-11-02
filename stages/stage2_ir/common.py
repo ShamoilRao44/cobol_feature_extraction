@@ -85,3 +85,59 @@ def paragraph_of(paragraphs: list[dict], line: int) -> str | None:
         if paragraph["line_start"] <= line <= paragraph["line_end"]:
             return paragraph["name"]
     return None
+
+
+def find_candidates(
+    code_lines: list[tuple[int, str]],
+    data_items: list[dict],
+    variable: str,
+) -> list[dict]:
+    """Find literal values assigned to a COBOL variable."""
+    variable = variable.split()[0].upper() if variable else ""
+    candidates = []
+    for index, (line_number, text) in enumerate(code_lines):
+        if not re.match(r"^\s*MOVE\b", text, re.IGNORECASE):
+            continue
+        statement, _ = statement_text(code_lines, index)
+        match = re.match(
+            r"""^\s*MOVE\s+(["'])(.*?)\1\s+TO\s+(.+)$""",
+            statement,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        targets = re.findall(r"[A-Z0-9][A-Z0-9-]*", match.group(3), re.IGNORECASE)
+        target_names = set()
+        skip_next = False
+        for target in targets:
+            if skip_next:
+                skip_next = False
+            elif target.upper() == "OF":
+                skip_next = True
+            else:
+                target_names.add(target.upper())
+        if variable in target_names:
+            value = match.group(2).strip().upper()[:40]
+            candidates.append({"value": value, "line": line_number, "how": "move"})
+
+    for item in data_items:
+        value = item.get("value")
+        if item.get("name") != variable or not value:
+            continue
+        literal = re.match(r"""^["'](.*?)["']""", value)
+        if literal:
+            candidates.append({
+                "value": literal.group(1).upper()[:40],
+                "line": item.get("line", 0),
+                "how": "value",
+            })
+        break
+    candidates.sort(key=lambda item: item["line"])
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate["value"] in seen:
+            continue
+        unique.append(candidate)
+        seen.add(candidate["value"])
+    return unique[:10]
