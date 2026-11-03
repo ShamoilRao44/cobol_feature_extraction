@@ -37,14 +37,37 @@ Each rule points to real line numbers. This is the first increment that uses an 
 - `rules_run.json`, the manifest: per program the status, rule count, unverified count,
   chunk count and chunk errors.
 
+## LLM settings (same code on the laptop and the VM)
+`llm.py` is one OpenAI-compatible client (`POST <base_url>/chat/completions`). Only the
+values change between machines. They are read from `.env` in the project root
+(git-ignored; copy `.env.example`), and real environment variables override them.
+
+| Variable | Laptop (Grok) | VM (local Qwen) |
+|---|---|---|
+| `LLM_BASE_URL` | `https://api.x.ai/v1` | the local server's OpenAI URL, e.g. `http://localhost:8000/v1` |
+| `LLM_MODEL` | `grok-3-mini` | the model name the local server reports |
+| `LLM_API_KEY` | your xAI key | empty, or whatever the local server expects |
+| `LLM_CONTEXT_TOKENS` | 64000 | 64000 |
+| `LLM_MAX_OUTPUT_TOKENS` | 8000 | 8000 |
+
+Token budget: before every call the prompt is estimated at ~3 characters per token and must
+fit in `context_tokens - max_output_tokens`, otherwise that chunk is recorded as an error.
+A 200-line chunk is about 4-7k tokens, far below the 56k budget.
+
 ## How to run
-```powershell
-$env:GROK_API_KEY = "<your key>"
-$env:GROK_MODEL = "grok-3-mini"   # optional; check the model names on your xAI account
-python app.py
-# POST /api/stage4/business-rules  with body {}  (or {"ir_dir": "<run folder>"})
-# poll GET /api/jobs/<job_id>, then GET /api/jobs/<job_id>/result
-```
+Laptop:
+1. `pip install -r requirements.txt` (adds python-dotenv), then `copy .env.example .env`
+   and put your xAI key in `LLM_API_KEY`.
+2. `python app.py`
+3. `POST /api/stage4/business-rules` with body `{}` (or `{"ir_dir": "<run folder>"}`).
+4. Poll `GET /api/jobs/<job_id>`, then read `GET /api/jobs/<job_id>/result`.
+
+VM (manual steps):
+1. Start the local Qwen3 Coder server and note its OpenAI-compatible URL and model name
+   (for example, open `<url>/models` in a browser or with curl).
+2. `cp .env.example .env`, then set `LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`
+   (the VM block in the file shows the shape).
+3. Run steps 2-4 above.
 
 ## Pass check
 - `python -m pytest` passes (the tests use a fake LLM, with no network).

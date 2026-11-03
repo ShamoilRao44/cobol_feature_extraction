@@ -2,7 +2,7 @@ import json
 
 from stages.stage1_inventory.inventory import build_inventory
 from stages.stage2_ir.runner import run_ir
-from stages.stage4_business_rules import chunks
+from stages.stage4_business_rules import chunks, llm
 from stages.stage4_business_rules.chunks import build_chunks
 from stages.stage4_business_rules.prompts import parse_rules
 from stages.stage4_business_rules.runner import run_business_rules
@@ -50,6 +50,44 @@ def make_ir_run(tmp_path):
     ir_dir = tmp_path / "ir"
     run_ir(build_inventory(str(source)), str(source), str(ir_dir))
     return ir_dir
+
+
+def test_env_file_then_env_override(tmp_path, monkeypatch):
+    """Read base_url/model/key from .env and let real LLM_* variables override it."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# VM settings\nLLM_BASE_URL=http://localhost:8000/v1/\n"
+        "LLM_MODEL=qwen3-coder-next\nLLM_API_KEY=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(llm, "ENV_PATH", str(env_file))
+    for name in llm.ENV_NAMES.values():
+        monkeypatch.delenv(name, raising=False)
+    config = llm.load_config()
+    assert config["base_url"] == "http://localhost:8000/v1"
+    assert config["model"] == "qwen3-coder-next"
+    assert config["context_tokens"] == 64000
+    assert llm.config_error(config) is None
+    monkeypatch.setenv("LLM_MODEL", "other-model")
+    assert llm.load_config()["model"] == "other-model"
+
+
+def test_grok_without_key_is_a_config_error():
+    """Require a key only for the hosted Grok API."""
+    config = dict(llm.DEFAULTS, api_key="")
+    assert "LLM_API_KEY" in llm.config_error(config)
+
+
+def test_prompt_over_budget_is_rejected_before_any_request():
+    """Refuse prompts that would not fit the model context with room for the reply."""
+    config = dict(llm.DEFAULTS, base_url="http://localhost:1/v1", context_tokens=1000,
+                  max_output_tokens=500)
+    try:
+        llm.ask_llm("system", "x" * 3000, config)
+    except ValueError as error:
+        assert "budget" in str(error)
+        return
+    raise AssertionError("expected ValueError")
 
 
 def test_parse_rules_accepts_fenced_json():
@@ -157,12 +195,13 @@ def test_api_requires_key_and_runs_with_fake_llm(tmp_path, monkeypatch):
     stage2.parent.mkdir(parents=True)
     ir_dir.rename(stage2)
     monkeypatch.setattr(flask_app, "WORKSPACE_DIR", str(tmp_path / "workspace"))
-    monkeypatch.delenv("GROK_API_KEY", raising=False)
-    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm, "ENV_PATH", str(tmp_path / "missing.env"))
+    for name in llm.ENV_NAMES.values():
+        monkeypatch.delenv(name, raising=False)
     flask_app.app.config.update(TESTING=True)
     with flask_app.app.test_client() as client:
         assert client.post("/api/stage4/business-rules", json={}).status_code == 400
-        monkeypatch.setenv("GROK_API_KEY", "test-key")
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
         monkeypatch.setattr(flask_app, "ASK_LLM", lambda s, p: reply([interest_rule()]))
         response = client.post("/api/stage4/business-rules", json={})
         assert response.status_code == 202

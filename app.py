@@ -12,11 +12,11 @@ from werkzeug.exceptions import BadRequest
 from stages.stage1_inventory.inventory import build_inventory, write_inventory
 from stages.stage2_ir.runner import run_ir
 from stages.stage3_project_ir.runner import run_project_ir
-from stages.stage4_business_rules.llm import api_key, ask_grok, model_name
+from stages.stage4_business_rules.llm import ask_llm, config_error, load_config
 from stages.stage4_business_rules.runner import run_business_rules
 
 app = Flask(__name__)
-ASK_LLM = ask_grok
+ASK_LLM = ask_llm
 WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -502,7 +502,7 @@ def api_start_project_ir():
     }), 202
 
 
-def run_business_rules_job(job_id, ir_dir, output_dir):
+def run_business_rules_job(job_id, ir_dir, output_dir, model):
     """Extract business rules in the background and report each program."""
     try:
         def report_progress(message):
@@ -515,7 +515,7 @@ def run_business_rules_job(job_id, ir_dir, output_dir):
             ir_dir,
             output_dir,
             ask=ASK_LLM,
-            model=model_name(),
+            model=model,
             cache_dir=os.path.join(WORKSPACE_DIR, "stage4_cache"),
             progress=report_progress,
             should_stop=JOBS[job_id]["stop_event"].is_set,
@@ -548,8 +548,13 @@ def api_start_business_rules():
     body, error = parse_api_json()
     if error:
         return error
-    if not api_key():
-        return jsonify({"error": "GROK_API_KEY is not set"}), 400
+    try:
+        llm_config = load_config()
+    except (OSError, ValueError) as error:
+        return jsonify({"error": f"Could not read LLM config: {error}"}), 400
+    llm_error = config_error(llm_config)
+    if llm_error:
+        return jsonify({"error": llm_error}), 400
     ir_dir, manifest, error = resolve_ir_run(body)
     if error:
         return error
@@ -579,10 +584,13 @@ def api_start_business_rules():
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
-    append_job_log(job_id, f"Business rules started with model {model_name()}.")
+    append_job_log(
+        job_id,
+        f"Business rules started with model {llm_config['model']} at {llm_config['base_url']}.",
+    )
     thread = threading.Thread(
         target=run_business_rules_job,
-        args=(job_id, ir_dir, output_dir),
+        args=(job_id, ir_dir, output_dir, llm_config["model"]),
         daemon=True,
     )
     thread.start()
