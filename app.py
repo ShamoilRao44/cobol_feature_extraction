@@ -12,8 +12,11 @@ from werkzeug.exceptions import BadRequest
 from stages.stage1_inventory.inventory import build_inventory, write_inventory
 from stages.stage2_ir.runner import run_ir
 from stages.stage3_project_ir.runner import run_project_ir
+from stages.stage4_business_rules.llm import api_key, ask_grok, model_name
+from stages.stage4_business_rules.runner import run_business_rules
 
 app = Flask(__name__)
+ASK_LLM = ask_grok
 WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -418,12 +421,8 @@ def api_start_ir():
     }), 202
 
 
-@app.route("/api/stage3/project-ir", methods=["POST"])
-def api_start_project_ir():
-    """Start consolidated project IR from the latest or a selected IR run."""
-    body, error = parse_api_json()
-    if error:
-        return error
+def resolve_ir_run(body):
+    """Return (ir_dir, manifest, None) for the requested or latest complete IR run, or an error response."""
     stage2_root = os.path.abspath(os.path.join(WORKSPACE_DIR, "stage2_outputs"))
     requested_dir = body.get("ir_dir")
     if requested_dir is None:
@@ -438,21 +437,33 @@ def api_start_project_ir():
         except ValueError:
             within_stage2 = False
         if not within_stage2:
-            return jsonify({"error": "ir_dir must be within workspace/stage2_outputs"}), 400
+            return None, None, (jsonify({"error": "ir_dir must be within workspace/stage2_outputs"}), 400)
     else:
-        return jsonify({"error": "ir_dir must be a non-empty string"}), 400
+        return None, None, (jsonify({"error": "ir_dir must be a non-empty string"}), 400)
     manifest_path = os.path.join(ir_dir, "ir_run.json") if ir_dir else ""
     if not ir_dir or not os.path.isfile(manifest_path):
-        return jsonify({"error": "No complete per-file IR run is available"}), 400
+        return None, None, (jsonify({"error": "No complete per-file IR run is available"}), 400)
     try:
         with open(manifest_path, encoding="utf-8") as source:
             manifest = json.load(source)
     except (OSError, json.JSONDecodeError) as error:
-        return jsonify({"error": f"Could not read IR run manifest: {error}"}), 400
+        return None, None, (jsonify({"error": f"Could not read IR run manifest: {error}"}), 400)
     if not isinstance(manifest, dict):
-        return jsonify({"error": "Invalid IR run manifest"}), 400
+        return None, None, (jsonify({"error": "Invalid IR run manifest"}), 400)
     if manifest.get("complete") is not True:
-        return jsonify({"error": "The selected IR run is incomplete"}), 409
+        return None, None, (jsonify({"error": "The selected IR run is incomplete"}), 409)
+    return ir_dir, manifest, None
+
+
+@app.route("/api/stage3/project-ir", methods=["POST"])
+def api_start_project_ir():
+    """Start consolidated project IR from the latest or a selected IR run."""
+    body, error = parse_api_json()
+    if error:
+        return error
+    ir_dir, manifest, error = resolve_ir_run(body)
+    if error:
+        return error
     job_id = uuid.uuid4().hex
     job = {
         "job_type": "project_ir",
@@ -480,6 +491,98 @@ def api_start_project_ir():
             ir_dir,
             os.path.join(WORKSPACE_DIR, "stage3_outputs"),
         ),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({
+        "job_id": job_id,
+        "status": "running",
+        "status_url": f"/api/jobs/{job_id}",
+        "result_url": f"/api/jobs/{job_id}/result",
+    }), 202
+
+
+def run_business_rules_job(job_id, ir_dir, output_dir):
+    """Extract business rules in the background and report each program."""
+    try:
+        def report_progress(message):
+            """Record one program's progress in the terminal and job stream."""
+            with JOBS_LOCK:
+                JOBS[job_id]["processed"] += 1
+            append_job_log(job_id, message)
+
+        result = run_business_rules(
+            ir_dir,
+            output_dir,
+            ask=ASK_LLM,
+            model=model_name(),
+            cache_dir=os.path.join(WORKSPACE_DIR, "stage4_cache"),
+            progress=report_progress,
+            should_stop=JOBS[job_id]["stop_event"].is_set,
+        )
+        with JOBS_LOCK:
+            job = JOBS[job_id]
+            job["rules_result"] = result
+            job["display_path"] = os.path.relpath(
+                output_dir, os.path.dirname(__file__)
+            ).replace(os.sep, "/")
+            job["status"] = "complete" if result["complete"] else "stopped"
+            rule_count = sum(item["rules"] for item in result["files"])
+            final_message = (
+                f"Business rules complete: {rule_count} rules from {len(result['files'])} programs."
+                if result["complete"]
+                else f"Business rules stopped after {len(result['files'])} programs."
+            )
+        append_job_log(job_id, final_message)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        with JOBS_LOCK:
+            job = JOBS[job_id]
+            job["status"] = "error"
+            job["error"] = str(error)
+        append_job_log(job_id, f"Error: {error}")
+
+
+@app.route("/api/stage4/business-rules", methods=["POST"])
+def api_start_business_rules():
+    """Start business-rule extraction from the latest or a selected IR run."""
+    body, error = parse_api_json()
+    if error:
+        return error
+    if not api_key():
+        return jsonify({"error": "GROK_API_KEY is not set"}), 400
+    ir_dir, manifest, error = resolve_ir_run(body)
+    if error:
+        return error
+    source_folder = manifest.get("source_folder", "")
+    if not os.path.isdir(source_folder):
+        return jsonify({"error": f"Source folder not found: {source_folder}"}), 400
+    source_name = os.path.basename(os.path.normpath(source_folder))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(
+        WORKSPACE_DIR, "stage4_outputs", f"{source_name}_rules_{timestamp}"
+    )
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_type": "business_rules",
+        "folder_path": source_folder,
+        "status": "running",
+        "logs": [],
+        "processed": 0,
+        "total": sum(1 for item in manifest.get("files", []) if item.get("type") == "cobol_program"),
+        "stop_event": threading.Event(),
+        "inventory": None,
+        "inventory_path": None,
+        "display_path": None,
+        "rules_result": None,
+        "error": None,
+        "ir_dir": ir_dir,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    append_job_log(job_id, f"Business rules started with model {model_name()}.")
+    thread = threading.Thread(
+        target=run_business_rules_job,
+        args=(job_id, ir_dir, output_dir),
         daemon=True,
     )
     thread.start()
@@ -582,6 +685,8 @@ def api_job_result(job_id):
             result = job["inventory"]
         elif job_type == "ir":
             result = job.get("ir_result")
+        elif job_type == "business_rules":
+            result = job.get("rules_result")
         else:
             result_path = job.get("project_ir_path")
             result = None
